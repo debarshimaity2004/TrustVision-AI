@@ -33,10 +33,10 @@ graph TD
     classDef ai fill:#f59e0b,stroke:#b45309,stroke-width:2px,color:#fff;
     classDef db fill:#6366f1,stroke:#4338ca,stroke-width:2px,color:#fff;
 
-    UI["💻 Frontend<br/>(React + Tailwind CSS)"]:::frontend
-    API["⚙️ Backend API<br/>(FastAPI + JWT)"]:::backend
-    ML["🧠 AI Engine<br/>(PyTorch + OpenCV + Grad-CAM)"]:::ai
-    DB[/"🗄️ Database<br/>(PostgreSQL)"/]:::db
+    UI["Frontend<br/>(React + Tailwind CSS)"]:::frontend
+    API["Backend API<br/>(FastAPI + JWT)"]:::backend
+    ML["AI Engine<br/>(PyTorch + OpenCV + Grad-CAM)"]:::ai
+    DB[/"Database<br/>(PostgreSQL)"/]:::db
 
     UI -- "REST APIs (Upload/Analyze)" --> API
     API -- "Frame Extraction & Inference" --> ML
