@@ -1,0 +1,12 @@
+@import "tailwindcss";
+
+/* Custom Base Styles for TrustVision AI */
+@layer base {
+  body {
+    background-color: var(--color-slate-900);
+    color: var(--color-slate-100);
+    font-family: ui-sans-serif, system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+}
