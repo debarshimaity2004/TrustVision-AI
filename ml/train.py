@@ -6,6 +6,7 @@ from torch.utils.data import DataLoader, random_split
 from torchvision import transforms
 from tqdm import tqdm
 import kagglehub
+from torch.amp import autocast, GradScaler
 
 from model import DeepfakeResNet
 from dataset import DeepfakeDataset
@@ -24,7 +25,7 @@ def main():
     # 1. Download Dataset
     print("\nDownloading dataset from Kaggle...")
     try:
-        dataset_path = kagglehub.dataset_download("sanikatiwarekar/deep-fake-detection-dfd-entire-original-dataset")
+        dataset_path = kagglehub.dataset_download("xhlulu/140k-real-and-fake-faces")
         print(f"Dataset securely downloaded/located at: {dataset_path}")
     except Exception as e:
         print(f"Failed to download dataset. Please install kagglehub: `pip install kagglehub`")
@@ -45,6 +46,15 @@ def main():
     # Creating Dataset instance
     dataset = DeepfakeDataset(data_dir=dataset_path, transform=transform)
     
+    print("\n================ DATASET METADATA ================")
+    print(f"Dataset Name:  {dataset.dataset_name}")
+    print(f"Total RAW Real Images: {dataset.total_real}")
+    print(f"Total RAW Fake Images: {dataset.total_fake}")
+    print(f"Active Training Set: {len(dataset)} images (Balanced)")
+    print("Labels Used:   [0] -> REAL")
+    print("               [1] -> FAKE")
+    print("==================================================\n")
+    
     if len(dataset) == 0:
         print("Error: No valid images or videos found in the dataset with given heuristic labels.")
         return
@@ -54,11 +64,16 @@ def main():
     val_size = len(dataset) - train_size
     train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
     
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True, prefetch_factor=2)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True, prefetch_factor=2)
 
     # 3. Model setup
     print("\nConfiguring model...")
+    if DEVICE.type == 'cpu':
+        print("WARNING: Running on CPU! For GTX 1650, ensure PyTorch with CUDA is installed.")
+    else:
+        print(f"Using GPU: {torch.cuda.get_device_name(0)}")
+    
     model = DeepfakeResNet(pretrained=True).to(DEVICE)
     model_path = os.path.join("models", "model.pth")
     os.makedirs("models", exist_ok=True)
@@ -76,6 +91,9 @@ def main():
     print("\nStarting Training...")
     best_val_acc = 0.0
 
+    # Set up Mixed Precision scaler
+    scaler = GradScaler('cuda')
+
     for epoch in range(1, NUM_EPOCHS + 1):
         model.train()
         running_loss = 0.0
@@ -85,14 +103,17 @@ def main():
         # training loop
         train_bar = tqdm(train_loader, desc=f"Epoch {epoch}/{NUM_EPOCHS} [Train]")
         for inputs, labels in train_bar:
-            inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
+            inputs, labels = inputs.to(DEVICE, non_blocking=True), labels.to(DEVICE, non_blocking=True)
             
-            optimizer.zero_grad()
-            outputs = model(inputs)
+            optimizer.zero_grad(set_to_none=True)
             
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
+            with autocast('cuda'):
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+                
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             
             running_loss += loss.item()
             _, predicted = torch.max(outputs.data, 1)
@@ -115,7 +136,7 @@ def main():
         with torch.no_grad():
             val_bar = tqdm(val_loader, desc=f"Epoch {epoch}/{NUM_EPOCHS} [Val] ")
             for inputs, labels in val_bar:
-                inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
+                inputs, labels = inputs.to(DEVICE, non_blocking=True), labels.to(DEVICE, non_blocking=True)
                 
                 outputs = model(inputs)
                 loss = criterion(outputs, labels)

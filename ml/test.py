@@ -5,6 +5,7 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 from tqdm import tqdm
 import kagglehub
+from torch.amp import autocast
 import numpy as np
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
 
@@ -22,7 +23,7 @@ def main():
     # 1. Download/Verify Dataset Location
     print("\nEnsuring dataset is downloaded...")
     try:
-        dataset_path = kagglehub.dataset_download("sanikatiwarekar/deep-fake-detection-dfd-entire-original-dataset")
+        dataset_path = kagglehub.dataset_download("xhlulu/140k-real-and-fake-faces")
         print(f"Dataset securely located at: {dataset_path}")
     except Exception as e:
         print(f"Failed to locate downloaded dataset. Is kagglehub installed? `pip install kagglehub`")
@@ -46,7 +47,7 @@ def main():
         
     # We will test on the full dataset or if you had separated train/test dirs, 
     # you would specify `data_dir` pointing to the test split.
-    test_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
+    test_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True, prefetch_factor=2)
 
     # 3. Model setup and loading weights
     model_path = os.path.join("models", "model.pth")
@@ -68,9 +69,11 @@ def main():
     with torch.no_grad():
         test_bar = tqdm(test_loader, desc="Testing")
         for inputs, labels in test_bar:
-            inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
+            inputs, labels = inputs.to(DEVICE, non_blocking=True), labels.to(DEVICE, non_blocking=True)
             
-            outputs = model(inputs)
+            with autocast('cuda'):
+                outputs = model(inputs)
+            
             _, predicted = torch.max(outputs.data, 1)
             
             # collect targets and predictions

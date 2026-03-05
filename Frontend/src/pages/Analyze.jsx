@@ -50,28 +50,48 @@ export default function Analyze() {
         setResult(null);
     };
 
-    const startAnalysis = () => {
+    const startAnalysis = async () => {
         if (!file) {
             toast.error("Please upload a file first");
             return;
         }
         setIsAnalyzing(true);
         setResult(null);
-        toast.loading("Scanning artifacts...", { id: "analysis-toast" });
+        toast.loading("Scanning artifacts via TrustVision API...", { id: "analysis-toast" });
 
-        // Mocking an inference API delay
-        setTimeout(() => {
-            setIsAnalyzing(false);
-            toast.success("Analysis complete!", { id: "analysis-toast" });
-            // Mock Results
-            setResult({
-                score: 87.4,
-                prediction: "REAL",
-                risk: "LOW",
-                time: "1.2s",
-                model: "ResNet-50 v2"
+        const formData = new FormData();
+        formData.append("file", file);
+
+        try {
+            const response = await fetch("http://localhost:8000/scan", {
+                method: "POST",
+                body: formData,
             });
-        }, 2500);
+
+            const data = await response.json();
+
+            if (!response.ok) {
+                throw new Error(data.detail || "API Scan failed");
+            }
+
+            // Map backend response matching the existing UI object structure
+            setResult({
+                score: data.authenticity_score,
+                prediction: data.prediction,
+                risk: data.risk_level,
+                confidence: data.confidence,
+                heatmap_base64: data.heatmap_base64,
+                model: "TrustVision DeepfakeResNet"
+            });
+
+            toast.success("Analysis complete!", { id: "analysis-toast" });
+
+        } catch (error) {
+            console.error("Analysis Error:", error);
+            toast.error(`Error: ${error.message}`, { id: "analysis-toast" });
+        } finally {
+            setIsAnalyzing(false);
+        }
     };
 
     return (
@@ -209,8 +229,8 @@ export default function Analyze() {
                                                     <span className="px-3 py-1 rounded-full bg-emerald-500/10 text-emerald-400 text-xs font-bold border border-emerald-500/20">{result.risk}</span>
                                                 </div>
                                                 <div className="flex justify-between items-center border-b border-slate-700 pb-3">
-                                                    <span className="text-slate-400">Inference Time</span>
-                                                    <span className="text-white font-mono">{result.time}</span>
+                                                    <span className="text-slate-400">Confidence Match</span>
+                                                    <span className="text-white font-mono">{result.confidence}%</span>
                                                 </div>
                                                 <div className="flex justify-between items-center">
                                                     <span className="text-slate-400">Model Framework</span>
@@ -218,19 +238,14 @@ export default function Analyze() {
                                                 </div>
                                             </div>
 
-                                            {/* Mock Image Grad-CAM Preview */}
-                                            {file && file.type.startsWith("image/") && (
+                                            {/* Grad-CAM Preview */}
+                                            {result.heatmap_base64 && (
                                                 <div className="mt-auto bg-slate-800 rounded-xl overflow-hidden border border-slate-700">
                                                     <div className="bg-slate-700/50 px-4 py-2 border-b border-slate-700 flex items-center justify-between">
-                                                        <span className="text-xs text-slate-300 font-medium tracking-wide">GRAD-CAM HEATMAP (SIMULATED)</span>
+                                                        <span className="text-xs text-slate-300 font-medium tracking-wide">AI GRAD-CAM HEATMAP</span>
                                                     </div>
-                                                    <div className="w-full h-40 bg-slate-900 relative">
-                                                        {/* We can use an object URL of the uploaded image as the background, overlaid with a tinted gradient to mock a heatmap */}
-                                                        <div className="absolute inset-0 bg-cover bg-center opacity-40 mix-blend-luminosity" style={{ backgroundImage: `url(${URL.createObjectURL(file)})` }}></div>
-                                                        <div className="absolute inset-0 bg-gradient-to-tr from-transparent via-emerald-500/10 to-red-500/20 mix-blend-overlay"></div>
-                                                        <div className="absolute inset-0 flex items-center justify-center">
-                                                            <span className="text-slate-400/50 text-sm px-4 text-center">No anomalies detected in spatial frequencies.</span>
-                                                        </div>
+                                                    <div className="w-full flex items-center justify-center bg-slate-900 overflow-hidden relative" style={{ minHeight: '160px' }}>
+                                                        <img src={result.heatmap_base64} alt="Deepfake Heatmap Analysis" className="object-contain h-48 w-full" />
                                                     </div>
                                                 </div>
                                             )}

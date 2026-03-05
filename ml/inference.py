@@ -4,13 +4,18 @@ import numpy as np
 import base64
 from torchvision import transforms
 from PIL import Image
+from scipy.fftpack import dct
 import os
 from pytorch_grad_cam import GradCAM
 from pytorch_grad_cam.utils.image import show_cam_on_image
 from .model import DeepfakeResNet
 
 class DeepfakeDetector:
-    def __init__(self, model_path="models/model.pth"):
+    def __init__(self, model_path=None):
+        if model_path is None:
+            # Construct the absolute path so we can call inference.py from anywhere (like the Backend root)
+            model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "model.pth")
+            
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
         # Load the architecture
@@ -40,6 +45,29 @@ class DeepfakeDetector:
         # Initialize OpenCV Face Detector (Haar Cascade)
         cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
         self.face_cascade = cv2.CascadeClassifier(cascade_path)
+
+    def detect_frequency_artifacts(self, gray_img):
+        """
+        State-of-the-Art Generative Models (Stable Diffusion, Midjourney) 
+        upsample images via decoders that leave unnatural repeating frequencies 
+        (checkerboard artifacts) in the high-frequency spectrum.
+        """
+        # Compute 2D Discrete Cosine Transform
+        dct_y = dct(dct(gray_img.T, norm='ortho').T, norm='ortho')
+        
+        # Calculate power spectrum
+        power_spectrum = np.abs(dct_y) ** 2
+        
+        # Isolate High Frequency vs Low Frequency domains
+        h, w = power_spectrum.shape
+        high_freq_energy = np.sum(power_spectrum[int(h*0.5):, int(w*0.5):])
+        total_energy = np.sum(power_spectrum)
+        
+        if total_energy == 0:
+            return 0
+            
+        ratio = high_freq_energy / total_energy
+        return ratio
 
     def detect_face(self, img_bgr):
         """Detects the largest face in an image and crops it with a margin."""
@@ -92,21 +120,59 @@ class DeepfakeDetector:
             pil_img = Image.fromarray(face_rgb)
             
             # Prepare tensor and transfer to device
-            input_tensor = self.transform(pil_img).unsqueeze(0).to(self.device)
+            input_tensor = self.transform(pil_img).unsqueeze(0).to(self.device, non_blocking=True)
             
             # 1. Forward Pass (Inference)
             # Use no_grad for memory efficiency during inference
-            with torch.no_grad():
+            with torch.no_grad(), torch.amp.autocast('cuda'):
                 output = self.model(input_tensor)
                 probs = torch.nn.functional.softmax(output, dim=1)[0]
                 
-            # Define classes: 0 = REAL, 1 = FAKE
+            # Our dataset assigns labels: 0 -> REAL, 1 -> FAKE
             real_prob = probs[0].item()
             fake_prob = probs[1].item()
             
+            # --- V2 Heuristic: AI Smoothness & Frequency Domain Artifacts ---
+            # Modern Diffusion models (like Midjourney) output unnaturally smooth gradients.
+            # They also leave statistical compression footprints in the high-frequency spectrum.
+            gray_face = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
+            laplacian_var = cv2.Laplacian(gray_face, cv2.CV_64F).var()
+            
+            # 1. Analyze Mathematical DCT spectrum for Generative Checkerboard Artifacts
+            hf_ratio = self.detect_frequency_artifacts(gray_face)
+            
+            # 2. Analyze Canny Edge Density
+            # Real human faces have pores, fine hairs, and subsurface light scattering that creates micro-edges.
+            # AI generators output plastic-like skin that dramatically reduces edge density.
+            edges = cv2.Canny(gray_face, 100, 200)
+            edge_density = np.sum(edges) / (gray_face.shape[0]*gray_face.shape[1])
+            
+            # Heuristic Penalty Voting System
+            # We don't want to accidentally flag real photographes taken with Soft Focus / Bokeh lenses
+            penalty_score = 0
+            if laplacian_var < 150: penalty_score += 1     # Fails Smoothness / Film Grain check
+            if hf_ratio < 0.0001: penalty_score += 1       # Fails Mathematical DCT upscale check
+            if edge_density < 8: penalty_score += 1        # Fails physical micro-edge texture check
+            
+            # If the image fails at least 2 out of 3 physics/reality checks simultaneously:
+            if penalty_score >= 2:
+                # Boost the fake probability by simulating a domain-shift correction
+                fake_prob += 4.0  
+                
+            # Normalize probabilities
+            total = real_prob + fake_prob
+            fake_prob = fake_prob / total
+            real_prob = real_prob / total
+            
             authenticity_score = real_prob * 100
-            prediction = "REAL" if real_prob > fake_prob else "FAKE"
-            confidence = max(real_prob, fake_prob) * 100
+            
+            # Use strict calibration logic for presentation confidence
+            if fake_prob > 0.45:
+                prediction = "FAKE"
+                confidence = fake_prob * 100
+            else:
+                prediction = "REAL"
+                confidence = real_prob * 100
             
             # Determine Risk Level
             if prediction == "FAKE" and confidence > 80:
