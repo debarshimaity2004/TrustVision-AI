@@ -1,0 +1,10 @@
+torch
+torchvision
+torchaudio
+opencv-python
+tqdm
+pillow
+kagglehub
+scikit-learn
+pytorch-grad-cam
+numpy
