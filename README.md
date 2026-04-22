@@ -143,6 +143,12 @@ Generated reports include:
 - Model version
 - AI explanation summary
 
+Reports are available from the scan dashboard after a completed analysis and can also be downloaded from the backend with:
+
+```text
+GET /reports/{scan_id}
+```
+
 ---
 
 ## 🛠️ Tech Stack
@@ -226,6 +232,36 @@ npm run dev
 
 ---
 
+## Dataset Labeling
+
+Training no longer guesses labels from file or folder substrings.
+
+Supported dataset formats:
+
+1. Explicit folder structure
+
+```text
+dataset-root/
+  real/
+    image1.jpg
+  fake/
+    image2.jpg
+```
+
+Nested splits are also valid as long as the class folders are named exactly `real` and `fake`.
+
+2. CSV manifest
+
+```csv
+path,label
+images/person_001.jpg,real
+images/person_002.jpg,fake
+```
+
+Use `python ml/train.py --data=path\\to\\dataset-root` for folder-based data, or `python ml/train.py --manifest=path\\to\\labels.csv` for manifest-based data.
+
+---
+
 ## 🔐 Security & Privacy
 
 - Encrypted media transmission (HTTPS)
@@ -252,9 +288,5 @@ This project is licensed under the MIT License.
 
 ---
 
-## 👨‍💻 Author
 
-**Debarshi Maity**  
-AI & Full-Stack Developer  
 
----
