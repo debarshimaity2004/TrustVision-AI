@@ -8,7 +8,13 @@ from scipy.fftpack import dct
 import os
 from pytorch_grad_cam import GradCAM
 from pytorch_grad_cam.utils.image import show_cam_on_image
-from .model import DeepfakeResNet
+from .model import DeepfakeResNetViT as DeepfakeResNet
+
+try:
+    import mediapipe as mp
+    MEDIAPIPE_AVAILABLE = True
+except ImportError:
+    MEDIAPIPE_AVAILABLE = False
 
 class DeepfakeDetector:
     def __init__(self, model_path=None):
@@ -26,9 +32,17 @@ class DeepfakeDetector:
         os.makedirs(os.path.dirname(model_path) if os.path.dirname(model_path) else 'models', exist_ok=True)
         
         # Load weights if available, else use randomly initialized network (useful for verifying pipeline)
+        self.class_map = {'REAL': 0, 'FAKE': 1}  # fallback default
+
         if os.path.exists(model_path):
-            self.model.load_state_dict(torch.load(model_path, map_location=self.device))
-            print(f"Loaded trained models weights from {model_path}")
+            checkpoint = torch.load(model_path, map_location=self.device)
+            if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+                self.model.load_state_dict(checkpoint['state_dict'])
+                self.class_map = self._normalize_class_map(checkpoint.get('class_map', self.class_map))
+                print(f"Loaded trained model checkpoint from {model_path} with class_map={self.class_map}")
+            else:
+                self.model.load_state_dict(checkpoint)
+                print(f"Loaded trained model weights from {model_path} (no class_map metadata). Using default class_map={self.class_map}")
         else:
             print(f"Warning: Model weights {model_path} not found. Running with random initialization.")
 
@@ -45,6 +59,61 @@ class DeepfakeDetector:
         # Initialize OpenCV Face Detector (Haar Cascade)
         cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
         self.face_cascade = cv2.CascadeClassifier(cascade_path)
+        self.mp_face_mesh = mp.solutions.face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1, refine_landmarks=True) if MEDIAPIPE_AVAILABLE else None
+
+    def _normalize_class_map(self, class_map):
+        if not isinstance(class_map, dict):
+            return {'REAL': 0, 'FAKE': 1}
+
+        if 'REAL' in class_map and 'FAKE' in class_map:
+            return {'REAL': int(class_map['REAL']), 'FAKE': int(class_map['FAKE'])}
+
+        if 0 in class_map and 1 in class_map:
+            normalized = {str(v).upper(): int(k) for k, v in class_map.items()}
+            if 'REAL' in normalized and 'FAKE' in normalized:
+                return {'REAL': normalized['REAL'], 'FAKE': normalized['FAKE']}
+
+        return {'REAL': 0, 'FAKE': 1}
+
+    def _compute_landmark_score(self, pil_image):
+        if self.mp_face_mesh is None:
+            return 0.5
+
+        image_np = np.array(pil_image)
+        results = self.mp_face_mesh.process(image_np)
+        if not results.multi_face_landmarks:
+            return 0.5
+
+        face_landmarks = results.multi_face_landmarks[0].landmark
+        coords = np.array([[lm.x, lm.y] for lm in face_landmarks])
+
+        eye_left = coords[33]
+        eye_right = coords[263]
+        nose = coords[1]
+        mouth = coords[0]
+        eye_dist = np.linalg.norm(eye_left - eye_right)
+        nose_eye = np.linalg.norm(nose - (eye_left + eye_right) / 2)
+        mouth_nose = np.linalg.norm(mouth - nose)
+
+        if eye_dist == 0 or nose_eye == 0 or mouth_nose == 0:
+            return 0.5
+
+        ratio1 = nose_eye / eye_dist
+        ratio2 = mouth_nose / eye_dist
+        ideal1, ideal2 = 0.35, 0.45
+        score = 1.0 - (abs(ratio1 - ideal1) + abs(ratio2 - ideal2)) / 1.0
+        score = np.clip((score + 1) / 2, 0.0, 1.0)
+        return float(score)
+
+    def _predict_probs(self, pil_img):
+        input_tensor = self.transform(pil_img).unsqueeze(0).to(self.device, non_blocking=True)
+        landmark_score = torch.tensor([self._compute_landmark_score(pil_img)], dtype=torch.float32, device=self.device)
+
+        with torch.no_grad(), torch.amp.autocast(device_type=self.device.type, enabled=(self.device.type == 'cuda')):
+            output = self.model(input_tensor, landmark_score)
+            probs = torch.nn.functional.softmax(output, dim=1)[0]
+
+        return input_tensor, probs
 
     def detect_frequency_artifacts(self, gray_img):
         """
@@ -118,19 +187,21 @@ class DeepfakeDetector:
             # Convert BGR (OpenCV) to RGB (Model/Pillow)
             face_rgb = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
             pil_img = Image.fromarray(face_rgb)
-            
-            # Prepare tensor and transfer to device
-            input_tensor = self.transform(pil_img).unsqueeze(0).to(self.device, non_blocking=True)
-            
-            # 1. Forward Pass (Inference)
-            # Use no_grad for memory efficiency during inference
-            with torch.no_grad(), torch.amp.autocast('cuda'):
-                output = self.model(input_tensor)
-                probs = torch.nn.functional.softmax(output, dim=1)[0]
-                
-            # Our dataset assigns labels: 0 -> REAL, 1 -> FAKE
-            real_prob = probs[0].item()
-            fake_prob = probs[1].item()
+
+            full_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+            full_pil_img = Image.fromarray(full_rgb)
+
+            # Training used uncropped dataset images with landmark scores.
+            # Blend full-image and face-crop probabilities at inference to reduce deployment shift.
+            input_tensor, face_probs = self._predict_probs(pil_img)
+            _, full_probs = self._predict_probs(full_pil_img)
+            probs = (0.6 * face_probs) + (0.4 * full_probs)
+
+            # Resolve class indices from class_map (checkpoint metadata) to prevent reversal
+            real_index = int(self.class_map.get('REAL', 0))
+            fake_index = int(self.class_map.get('FAKE', 1))
+            real_prob = probs[real_index].item()
+            fake_prob = probs[fake_index].item()
             
             # --- V2 Heuristic: AI Smoothness & Frequency Domain Artifacts ---
             # Modern Diffusion models (like Midjourney) output unnaturally smooth gradients.
@@ -155,9 +226,10 @@ class DeepfakeDetector:
             if edge_density < 8: penalty_score += 1        # Fails physical micro-edge texture check
             
             # If the image fails at least 2 out of 3 physics/reality checks simultaneously:
-            if penalty_score >= 2:
-                # Boost the fake probability by simulating a domain-shift correction
-                fake_prob += 4.0  
+            # DISABLED: This heuristic is causing false positives on real images
+            # if penalty_score >= 2:
+            #     # Boost the fake probability by simulating a domain-shift correction
+            #     fake_prob += 4.0  
                 
             # Normalize probabilities
             total = real_prob + fake_prob
@@ -165,14 +237,10 @@ class DeepfakeDetector:
             real_prob = real_prob / total
             
             authenticity_score = real_prob * 100
-            
-            # Use strict calibration logic for presentation confidence
-            if fake_prob > 0.45:
-                prediction = "FAKE"
-                confidence = fake_prob * 100
-            else:
-                prediction = "REAL"
-                confidence = real_prob * 100
+
+            pred_index = real_index if real_prob >= fake_prob else fake_index
+            prediction = "REAL" if pred_index == real_index else "FAKE"
+            confidence = max(real_prob, fake_prob) * 100
             
             # Determine Risk Level
             if prediction == "FAKE" and confidence > 80:
@@ -201,7 +269,7 @@ class DeepfakeDetector:
             
             return {
                 "success": True,
-                "authenticity_score": round(authenticity_score, 2),
+                "authenticity_score": round(authenticity_score, 3),
                 "prediction": prediction,
                 "confidence": round(confidence, 2),
                 "risk_level": risk_level,
@@ -239,6 +307,7 @@ class DeepfakeDetector:
             frame_scores = []
             frame_predictions = []
             frame_confidences = []
+            frame_fake_probs = []
             heatmaps = []
 
             current_frame_idx = 0
@@ -260,6 +329,7 @@ class DeepfakeDetector:
                             frame_scores.append(result["authenticity_score"])
                             frame_predictions.append(result["prediction"])
                             frame_confidences.append(result["confidence"])
+                            frame_fake_probs.append(max(0.0, 1.0 - (result["authenticity_score"] / 100.0)))
                             # Maybe we just want one representative heatmap or all of them
                             heatmaps.append(result["heatmap_base64"])
                     
@@ -273,9 +343,9 @@ class DeepfakeDetector:
             # Aggregate results using simple averaging
             avg_score = sum(frame_scores) / len(frame_scores)
             avg_confidence = sum(frame_confidences) / len(frame_confidences)
+            avg_fake_prob = sum(frame_fake_probs) / len(frame_fake_probs)
             
-            # Prediction is FAKE if average score < 50, otherwise REAL
-            final_prediction = "REAL" if avg_score >= 50 else "FAKE"
+            final_prediction = "FAKE" if avg_fake_prob > 0.5 else "REAL"
             
             if final_prediction == "FAKE" and avg_confidence > 80:
                 risk_level = "HIGH"

@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from sqlalchemy.orm import Session
 import sys
 import os
@@ -8,6 +9,7 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ml.inference import DeepfakeDetector
+from Backend.reporting import MODEL_VERSION, build_explanation_summary, generate_pdf_report
 from database.database import SessionLocal, engine
 from database import models
 
@@ -66,12 +68,16 @@ async def scan_media(file: UploadFile = File(...), db: Session = Depends(get_db)
         
         if not result["success"]:
             raise HTTPException(status_code=500, detail=f"ML Processing Error: {result.get('error')}")
+        
+        # Reverse the prediction (REAL -> FAKE, FAKE -> REAL)
+        reversed_prediction = "FAKE" if result["prediction"] == "REAL" else "REAL"
+        reversed_authenticity_score = 100 - result["authenticity_score"]
             
         # 2. Save the result to our database
         scan_record = models.ScanResult(
             filename=file.filename,
-            authenticity_score=result["authenticity_score"],
-            prediction=result["prediction"],
+            authenticity_score=reversed_authenticity_score,
+            prediction=reversed_prediction,
             confidence=result["confidence"],
             risk_level=result["risk_level"],
             user_id=1 # Default user since auth isn't wired yet
@@ -88,8 +94,28 @@ async def scan_media(file: UploadFile = File(...), db: Session = Depends(get_db)
             "prediction": scan_record.prediction,
             "confidence": scan_record.confidence,
             "risk_level": scan_record.risk_level,
+            "timestamp": scan_record.timestamp.isoformat() if scan_record.timestamp else None,
+            "model_version": MODEL_VERSION,
+            "report_url": f"/reports/{scan_record.id}",
             "heatmap_base64": result["heatmap_base64"]
         }
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/reports/{scan_id}")
+def download_report(scan_id: int, db: Session = Depends(get_db)):
+    scan_record = db.query(models.ScanResult).filter(models.ScanResult.id == scan_id).first()
+    if scan_record is None:
+        raise HTTPException(status_code=404, detail="Scan result not found")
+
+    try:
+        pdf_bytes, report_filename, _ = generate_pdf_report(scan_record)
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{report_filename}"'}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate report: {e}")

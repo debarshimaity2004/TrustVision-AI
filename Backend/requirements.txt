@@ -12,3 +12,4 @@ torch==2.10.0
 torchvision==0.25.0
 numpy==1.26.2
 grad-cam==1.4.8
+reportlab==4.2.5
